@@ -2,21 +2,40 @@
  * Experimental fast CSV reader.
  *
  * Based on RFC 4180.
+ * By HS Teoh from D forum
  */
 module fastcsv;
+import std.conv:to;
+import std.csv;
+import std.math;
+import std.traits;
+import std.experimental.allocator;
+import std.experimental.allocator.common;
+import std.experimental.allocator.mallocator;
+import std.experimental.allocator.building_blocks.allocator_list;
+import std.experimental.allocator.building_blocks.quantizer;
+import std.experimental.allocator.building_blocks.region;
+import std.experimental.allocator.building_blocks.free_tree;
+import std.experimental.allocator.showcase;
 
+private enum csvAllocMultiple = 1024*1024*1.0;
+alias CSVAllocator = Quantizer!(
+                                FreeTree!(AllocatorList!((size_t n) => Region!Mallocator(n))),
+                                                                        n => (ceil(n/csvAllocMultiple)*csvAllocMultiple).to!ulong);
+CSVAllocator csvAllocator;
 /**
  * Reads CSV data from the given filename.
  */
 auto csvFromUtf8File(string filename)
 {
     import std.file : read;
-    return csvToArray(cast(string) read(filename));
+    return csvToArray(cast(string)read(filename));
 }
 
-private char[] filterQuotes(dchar quote)(const(char)[] str) pure
+private T[] filterQuotes(dchar quote, T)(T[] str)
+if (is(Unqual!T == char))
 {
-    auto buf = new char[str.length];
+    auto buf = csvAllocator.makeArray!char(str.length);
     size_t j = 0;
     for (size_t i = 0; i < str.length; i++)
     {
@@ -33,7 +52,7 @@ private char[] filterQuotes(dchar quote)(const(char)[] str) pure
         }
         buf[j++] = str[i];
     }
-    return buf[0 .. j];
+    return cast(T[])buf[0 .. j];
 }
 
 /**
@@ -54,22 +73,23 @@ private char[] filterQuotes(dchar quote)(const(char)[] str) pure
  *  Cannot handle records with more than 4096 fields each. (This limit can be
  *  statically increased by increasing fieldBlockSize.)
  */
-auto csvByRecord(dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
+auto csvByRecord(dchar fieldDelim=',', dchar quote='"', T)(T[] input)
+if (is(Unqual!T == char))
 {
     struct Result
     {
         private enum fieldBlockSize = 1 << 16;
-        private const(char)[] data;
-        private const(char)[][] fields;
+        private T[] data;
+        private T[][] fields;
         private size_t i, curField;
 
         bool empty = true;
-        const(char)[][] front;
+        T[][] front;
 
-        this(const(char)[] input)
+        this(T[] input)
         {
             data = input;
-            fields = new const(char)[][fieldBlockSize];
+            fields = csvAllocator.makeArray!(T[])(fieldBlockSize);
             i = 0;
             curField = 0;
             empty = (input.length == 0);
@@ -120,9 +140,8 @@ auto csvByRecord(dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
                 {
                     // Fields block is full; copy current record fields into
                     // new block so that they are contiguous.
-                    auto nextFields = new const(char)[][fieldBlockSize];
-                    nextFields[0 .. curField - firstField] =
-                        fields[firstField .. curField];
+                    auto nextFields =  csvAllocator.makeArray!(T[])(fieldBlockSize);
+                    nextFields[0 .. curField - firstField] = fields[firstField .. curField];
 
                     //fields.length = firstField; // release unused memory?
 
@@ -132,8 +151,7 @@ auto csvByRecord(dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
                 }
                 assert(curField < fields.length);
                 if (hasDoubledQuotes)
-                    fields[curField++] = filterQuotes!quote(
-                                            data[firstChar .. lastChar]);
+                    fields[curField++] = filterQuotes!quote(data[firstChar .. lastChar]);
                 else
                     fields[curField++] = data[firstChar .. lastChar];
 
@@ -174,15 +192,16 @@ auto csvByRecord(dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
  * Returns:
  *  An array of records, each of which is an array of fields.
  */
-auto csvToArray(dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
+auto csvToArray(dchar fieldDelim=',', dchar quote='"', T)(T[] input)
+if (is(Unqual!T == char))
 {
     import core.memory : GC;
     import std.array : array;
 
-    GC.disable();
+    //GC.disable();
     auto result = input.csvByRecord!(fieldDelim, quote).array;
-    GC.collect();
-    GC.enable();
+    //GC.collect();
+    //GC.enable();
     return result;
 }
 
@@ -293,28 +312,24 @@ static if (__VERSION__ < 2067UL)
  *
  * Returns:
  *  An array of S.
- *
- * Bugs:
- *  Cannot handle strings larger than 64KB each. (This limit can be statically
- *  raised by increasing stringBufSize.)
  */
-auto csvByStruct(S, dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
-    if (is(S == struct))
+auto csvByStruct(S, dchar fieldDelim=',', dchar quote='"', T)(T[] input)
+if (is(S == struct) && is(Unqual!T == char))
 {
     struct Result
     {
         private enum stringBufSize = 1 << 16;
-        private const(char)[] data;
-        private char[] stringBuf;
+        private T[] data;
+        private Unqual!T[] stringBuf;
         private size_t i, curStringIdx;
 
         bool empty = true;
         S front;
 
-        this(const(char)[] input)
+        this(T[] input)
         {
             data = input;
-            stringBuf = new char[stringBufSize];
+            stringBuf = csvAllocator.makeArray!char(stringBufSize);
             i = 0;
             curStringIdx = 0;
 
@@ -327,7 +342,7 @@ auto csvByStruct(S, dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
             }
         }
 
-        const(char)[] parseField() pure
+        T[] parseField()
         {
             size_t firstChar, lastChar;
             bool hasDoubledQuotes = false;
@@ -405,7 +420,7 @@ auto csvByStruct(S, dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
                 alias Value = typeof(__traits(getMember, front, field));
 
                 // Convert value
-                const(char)[] strval = parseField();
+                T[] strval = parseField();
                 static if (is(Value == string))
                 {
                     // Optimization for string fields: instead of many small
@@ -414,10 +429,10 @@ auto csvByStruct(S, dchar fieldDelim=',', dchar quote='"')(const(char)[] input)
                     if (strval.length + curStringIdx >= stringBuf.length)
                     {
                         // String buffer full; allocate new buffer.
-                        stringBuf = new char[stringBufSize];
+                        stringBuf = csvAllocator.makeArray!char(stringBufSize);
                         curStringIdx = 0;
                     }
-                    stringBuf[curStringIdx .. curStringIdx + strval.length] = 
+                    stringBuf[curStringIdx .. curStringIdx + strval.length] =
                         strval[0 .. $];
 
                     // Since we never take overlapping slices of stringBuf,
